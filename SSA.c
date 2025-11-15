@@ -6,10 +6,10 @@
 #include <time.h>
 
 #define N 2
-#define num_salp 10
+#define num_salp 30
 #define LB -10.0 //cận dưới
 #define UB 10.0 //cận trên
-#define MAX_ITER 100
+#define MAX_ITER 500
 
 
 double position[num_salp][N];
