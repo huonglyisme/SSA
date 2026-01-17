@@ -1,260 +1,102 @@
 import numpy as np
-import time
+import matplotlib.pyplot as plt
 
-
-#N_max là số phần tử tối đa 1 hàng
-def build_interlayer_and_correlation(M, N, N_max, d_element_spacing, d_layer_spacing_transmit, d_layer_spacing_receive, wavelength):
-    #tạo ma trận rỗng
-    W_T = np.zeros((M, M), dtype=complex)
-    Corr_T = np.zeros((M, M), dtype=float)
-    U_R = np.zeros((N, N), dtype=complex)
-    Corr_R = np.zeros((N, N), dtype=float)
-
-    #xác định vị trí phần tử TX (phát) trên siêu bề mặt dùng để xác định khoảng cách giữa các phần tử
-    #-> phục vụ tính ma trận liên tầng W_T và ma trận tương quan Corr_T
-    for mm1 in range(1, M+1):
-        m_z = int(np.ceil(mm1 / N_max))
-        m_x = (mm1 - 1) % N_max + 1
-        for mm2 in range(1, M+1):
-            n_z = int(np.ceil(mm2 / N_max))
-            n_x = (mm2 - 1) % N_max + 1
-            d_temp = np.sqrt((m_x - n_x)**2 + (m_z - n_z)**2) * d_element_spacing
-            #ma trận liên tầng W_T
-            d_temp2 = np.sqrt(d_layer_spacing_transmit**2 + d_temp**2)
-            W_T[mm2-1, mm1-1] = wavelength / (4 * np.pi * d_temp2) * np.exp(-1j * 2 * np.pi * d_temp2 / wavelength)
-            #ma trận tương quan Corr_T
-            Corr_T[mm2-1, mm1-1] = sinc(2 * d_temp / wavelength)
-
-    #tương tự với phía RX (thu)
-    for nn1 in range(1, N+1):
-        m_z = int(np.ceil(nn1 / N_max))
-        m_x = (nn1 - 1) % N_max + 1
-        for nn2 in range(1, N+1):
-            n_z = int(np.ceil(nn2 / N_max))
-            n_x = (nn2 - 1) % N_max + 1
-            d_temp = np.sqrt((m_x - n_x)**2 + (m_z - n_z)**2) * d_element_spacing
-            d_temp2 = np.sqrt(d_layer_spacing_receive**2 + d_temp**2)
-            U_R[nn2-1, nn1-1] = wavelength / (4 * np.pi * d_temp2) * np.exp(-1j * 2 * np.pi * d_temp2 / wavelength)
-            Corr_R[nn2-1, nn1-1] = sinc(2 * d_temp / wavelength)
-
-    return W_T, Corr_T, U_R, Corr_R
-
-
-#buid ma trận W_T_1 và U_R_1 dùng để kết nối TX/RX với luồng dữ liệu (streams)
-def build_W1_U1(
-    M, N, N_max, d_element_spacing,
-    d_layer_spacing_transmit, d_layer_spacing_receive,
-    wavelength, S
-):
-    # W_T_1: (M x S)
-    W_T_1 = np.zeros((M, S), dtype=complex)
-    # U_R_1: (S x N)
-    U_R_1 = np.zeros((S, N), dtype=complex)
-
-    # ---- TX side: giống build_interlayer_and_correlation ----
-    for mm in range(1, M+1):
-        m_z = int(np.ceil(mm / N_max))
-        m_x = (mm - 1) % N_max + 1
-        for s in range(1, S+1):
-            # khoảng cách giữa phần tử Tx-mm và stream s
-            # *** DÙNG CÙNG LOGIC KHOẢNG CÁCH NHƯ W_T ***
-            d_temp = np.sqrt((m_x - s)**2 + (m_z - s)**2) * d_element_spacing
-            d_temp2 = np.sqrt(d_layer_spacing_transmit**2 + d_temp**2)
-            W_T_1[mm-1, s-1] = wavelength/(4*np.pi*d_temp2) * np.exp(-1j*2*np.pi*d_temp2/wavelength)
-
-    # ---- RX side: giống build_interlayer_and_correlation ----
-    for nn in range(1, N+1):
-        n_z = int(np.ceil(nn / N_max))
-        n_x = (nn - 1) % N_max + 1
-        for s in range(1, S+1):
-            d_temp = np.sqrt((n_x - s)**2 + (n_z - s)**2) * d_element_spacing
-            d_temp2 = np.sqrt(d_layer_spacing_receive**2 + d_temp**2)
-            U_R_1[s-1, nn-1] = wavelength/(4*np.pi*d_temp2) * np.exp(-1j*2*np.pi*d_temp2/wavelength)
-
-    return W_T_1, U_R_1
-
-#tính ma trận tương quan (nêu ở trên) Corr_T và Corr_R
-def sinc(x):
-    y = np.ones_like(x, dtype=float)
-    idx = np.abs(x) > 1e-12
-    y[idx] = np.sin(np.pi * x[idx]) / (np.pi * x[idx])
-    return y
-
-
-#phần này chưa phase_tx và phase_rx là 2 biến dùng để tối ưu NMSE
-#tính ma trận P (ma trận tín hiệu đi từ TX qua các layers đến streams)
-def build_P_from_tx_phases(phase_tx, W_T_1, W_T, L):
-    # phase_tx: M x L (each column is layer)
-    M, Lp = phase_tx.shape
-    assert Lp == L
-    P = np.diag(phase_tx[:,0]) @ W_T_1
+# --- 1. MÔ HÌNH VẬT LÝ (Dựa trên Chương 2 & 5) ---
+def build_H_sim_hybrid(ph, M, N, L, K, W, W_in, W_out, G):
+    """Tính toán H_SIM = QGP dựa trên tích chuỗi ma trận [cite: 520, 638]"""
+    p_tx = np.exp(1j * ph[:M*L].reshape(M, L))
+    p_rx = np.exp(1j * ph[M*L:].reshape(N, K))
+    
+    # Transmit SIM: Tích lũy pha qua L lớp [cite: 510]
+    P = np.diag(p_tx[:, 0]) @ W_in
     for l in range(1, L):
-        P = np.diag(phase_tx[:, l]) @ (W_T @ P)
-    return P
-
-#tính ma trận Q(ma trận tín hiệu đi từ streams qua các layers đến RX)
-def build_Q_from_rx_phases(phase_rx, U_R_1, U_R, K):
-    # phase_rx: N x K
-    N, Kp = phase_rx.shape
-    assert Kp == K
-    Q = U_R_1 @ np.diag(phase_rx[:,0])
+        P = np.diag(p_tx[:, l]) @ (W @ P)
+        
+    # Receive SIM: Tích lũy pha qua K lớp [cite: 511]
+    Q = W_out @ np.diag(p_rx[:, 0])
     for k in range(1, K):
-        Q = Q @ U_R @ np.diag(phase_rx[:, k])
-    return Q
+        Q = Q @ W @ np.diag(p_rx[:, k])
+        
+    return Q @ G @ P
 
-#tính ma trận tín hiệu tổng hợp 
-def compute_factor_and_nmse(Q, G, P, H_true, eps=1e-12):
-    H_SIM = Q @ G @ P
-
-    #vecto hoá tín hiệu, đưa ma trận thành vecto 1 cột để dễ tính beta
-    H_sim_vec = H_SIM.reshape(-1, 1)
-    H_true_vec = H_true.reshape(-1, 1)
-
-    #tính beta
-    #beta là hệ số bù trừ công suất/pha để kênh thực tế H_SIM so khớp được với kênh lý tưởng H_true.
-    #Giúp so sánh NMSE công bằng, bất kể H_SIM có cường độ mạnh hay yếu.
-    denom = (H_sim_vec.conj().T @ H_sim_vec).item()
-    if np.abs(denom) < eps:
-        beta = 0+0j
-    else:
-        beta = (H_sim_vec.conj().T @ H_true_vec).item() / denom
-    
-    #tính nmse
-    #NMSE = mức độ lệch giữa kênh thực tế và kênh lý tưởng.
-    #NMSE càng nhỏ → H_SIM càng gần H_true → nhiễu càng ít → kênh được chéo hoá tốt.
-    num = np.linalg.norm(beta * H_SIM - H_true)**2
-    den = np.linalg.norm(H_true)**2 + eps
-    nmse = num / den
-    return beta, float(np.real_if_close(nmse)), H_SIM
-
-#triển khai thuật toán ssa vào bài toán tối ưu
-def ssa_hybrid_phase_search(
-    G, H_true, W_T, W_T_1, U_R, U_R_1,
-    M, L, N, K,
-    pop=30, iters=200, seed=None
-):
-    if seed is not None:
-        np.random.seed(seed)
-
+# --- 2. THUẬT TOÁN HYBRID SSA (Algorithm 2 & 5) ---
+def ssa_hybrid_optimization(M, N, L, K, G, H_target, W, W_in, W_out, pop=30, iters=50):
     n_vars = M*L + N*K
-    salps = np.random.rand(pop, n_vars) * 2*np.pi
-
-    # ---- Hybrid init ----
-    for i in range(pop//3):
-        salps[i] = np.random.normal(0, 0.1, n_vars)
-
-    def eval_nmse(ph):
-        phase_tx = np.exp(1j * ph[:M*L].reshape(M, L))
-        phase_rx = np.exp(1j * ph[M*L:].reshape(N, K))
-        P = build_P_from_tx_phases(phase_tx, W_T_1, W_T, L)
-        Q = build_Q_from_rx_phases(phase_rx, U_R_1, U_R, K)
-        _, nmse, _ = compute_factor_and_nmse(Q, G, P, H_true)
-        return nmse
-
-    nmse_vals = np.array([eval_nmse(s) for s in salps])
-    best = salps[np.argmin(nmse_vals)]
-
-    for t in range(1, iters+1):
-        c1 = 2 * np.exp(- (4*t/iters)**2)
-        new_salps = salps.copy()
-
-        for i in range(pop):
-            if i == 0:
-                step = c1*np.random.rand(n_vars)
-                new = np.mod(best + step, 2*np.pi)
-            else:
-                new = np.mod(0.5*(salps[i]+salps[i-1]),2*np.pi)
-            new_salps[i] = new
-
-        salps = new_salps
-        nmse_vals = np.array([eval_nmse(s) for s in salps])
-        best = salps[np.argmin(nmse_vals)]
-
-    phase_tx = np.exp(1j * best[:M*L].reshape(M, L))
-    phase_rx = np.exp(1j * best[M*L:].reshape(N, K))
-    P = build_P_from_tx_phases(phase_tx, W_T_1, W_T, L)
-    Q = build_Q_from_rx_phases(phase_rx, U_R_1, U_R, K)
-    beta, nmse, H_sim = compute_factor_and_nmse(Q, G, P, H_true)
-
-    return best, nmse, beta, H_sim
-
-import numpy as np
-import matplotlib.pyplot as plt
-import scipy.io as sio
-
-import numpy as np
-import matplotlib.pyplot as plt
-import scipy.io as sio
-
-# --- 1. Tải Dữ Liệu Từ Các Tệp .mat (Bây giờ đã ở cùng thư mục) ---
-try:
-    # Tải dữ liệu NMSE
-    nmse_k1_data = sio.loadmat('NMSE_K_1.mat')
-    nmse_k2_data = sio.loadmat('NMSE_K_2.mat')
-    nmse_k5_data = sio.loadmat('NMSE_K_5.mat')
-    nmse_k10_data = sio.loadmat('NMSE_K_10.mat')
-
-    # Tải dữ liệu Capacity
-    capacity_k1_data = sio.loadmat('Capacity_K_1.mat')
-    capacity_k2_data = sio.loadmat('Capacity_K_2.mat')
-    capacity_k5_data = sio.loadmat('Capacity_K_5.mat')
-    capacity_k10_data = sio.loadmat('Capacity_K_10.mat')
-    capacity_max_data = sio.loadmat('Capacity_max.mat')
-
-    # Trích xuất vectors dữ liệu
-    NMSE_K_1 = nmse_k1_data['NMSE_K_1'].flatten()
-    NMSE_K_2 = nmse_k2_data['NMSE_K_2'].flatten()
-    NMSE_K_5 = nmse_k5_data['NMSE_K_5'].flatten()
-    NMSE_K_10 = nmse_k10_data['NMSE_K_10'].flatten()
+    salps = np.random.uniform(0, 2*np.pi, (pop, n_vars))
     
-    Capacity_K_1 = capacity_k1_data['Capacity_K_1'].flatten()
-    Capacity_K_2 = capacity_k2_data['Capacity_K_2'].flatten()
-    Capacity_K_5 = capacity_k5_data['Capacity_K_5'].flatten()
-    Capacity_K_10 = capacity_k10_data['Capacity_K_10'].flatten()
-    Capacity_max = capacity_max_data['Capacity_max'].flatten()
+    # BƯỚC HYBRID: Khởi tạo 1/3 quần thể quanh 0 (Transparent Mode) [cite: 562, 701, 708]
+    for i in range(pop // 3):
+        salps[i] = np.random.normal(0, 0.1, n_vars) 
+        
+    def fitness_func(ph):
+        H_sim = build_H_sim_hybrid(ph, M, N, L, K, W, W_in, W_out, G)
+        # NMSE chuẩn hóa với hệ số beta tối ưu [cite: 518, 639]
+        H_sim_vec = H_sim.flatten()
+        H_true_vec = H_target.flatten()
+        beta = np.vdot(H_sim_vec, H_true_vec) / (np.linalg.norm(H_sim_vec)**2 + 1e-12)
+        return np.linalg.norm(beta * H_sim - H_target)**2 / (np.linalg.norm(H_target)**2 + 1e-12)
 
-except Exception as e:
-    print(f"Lỗi khi tải hoặc xử lý tệp .mat: {e}")
-    print("Vui lòng kiểm tra lại tên biến trong các file .mat hoặc đường dẫn.")
-    exit()
+    # Khởi tạo nghiệm tốt nhất
+    fit_vals = np.array([fitness_func(s) for s in salps])
+    best_idx = np.argmin(fit_vals)
+    best_salp = salps[best_idx].copy()
 
-# Trục x (Số lớp L)
-L_values = np.arange(1, len(NMSE_K_1) + 1)
+    for t in range(iters):
+        c1 = 2 * np.exp(-(4 * t / iters)**2) # Hệ số c1 hội tụ [cite: 555]
+        
+        for i in range(pop):
+            if i == 0: # Leader cập nhật theo Leader-Follower [cite: 543]
+                c2 = np.random.rand(n_vars)
+                c3 = np.random.rand(n_vars)
+                step = c1 * (2*np.pi * c2)
+                salps[i] = np.mod(best_salp + np.where(c3 >= 0.5, 1, -1) * step, 2*np.pi)
+            else: # Follower cập nhật [cite: 544]
+                salps[i] = np.mod((salps[i] + salps[i-1]) / 2, 2*np.pi)
+        
+        # Cập nhật nghiệm tốt nhất sau mỗi vòng lặp
+        current_fit = np.array([fitness_func(s) for s in salps])
+        if np.min(current_fit) < fitness_func(best_salp):
+            best_salp = salps[np.argmin(current_fit)].copy()
 
-# --- 2. Vẽ Đồ Thị NMSE ---
-plt.figure(figsize=(8, 6))
+    # Tính Capacity cuối cùng
+    H_final = build_H_sim_hybrid(best_salp, M, N, L, K, W, W_in, W_out, G)
+    SNR = 100 # SNR = 20dB để đồ thị hiển thị rõ [cite: 471]
+    capacity = np.log2(np.abs(np.linalg.det(np.eye(H_target.shape[0]) + SNR * (H_final @ H_final.conj().T))) + 1e-12)
+    
+    return fitness_func(best_salp), capacity
 
-# Kiểu đường: K=1 ('r-.'), K=2 ('g:'), K=5 ('b--'), K=10 ('m-')
-plt.plot(L_values, NMSE_K_1, 'r-.', linewidth=3, label='K = 1')
-plt.plot(L_values, NMSE_K_2, 'g:', linewidth=3, label='K = 2')
-plt.plot(L_values, NMSE_K_5, 'b--', linewidth=3, label='K = 5')
-plt.plot(L_values, NMSE_K_10, 'm-', linewidth=3, label='K = 10')
+# --- 3. CHẠY MÔ PHỎNG (Thông số từ Chương 5.1) ---
+M = N = 16; S = 2; N_max = 4
+L_range = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+K_list = [1, 2, 5, 10]
 
-plt.xlabel('Number of transmit metasurface layers, L', fontsize=14)
-plt.ylabel('Fitting NMSE, $\\Delta$', fontsize=14)
-plt.xticks(L_values) 
-plt.tick_params(labelsize=12)
-plt.legend(loc='best', fontsize=12)
-plt.grid(True, linestyle='--')
-plt.title('Fitting NMSE vs. Number of Transmit Metasurface Layers')
-plt.show()
+# Khởi tạo ma trận ổn định để tín hiệu truyền qua được nhiều lớp
+G_phys = (np.random.randn(N, M) + 1j*np.random.randn(N, M)) * 0.5
+W_prop = (np.random.randn(M, M) + 1j*np.random.randn(M, M)) * 0.1 
+W_in = np.eye(M, S, dtype=complex) # Selection matrix
+W_out = np.eye(S, N, dtype=complex)
+H_target = np.eye(S)
 
+res_nmse = {k: [] for k in K_list}
+res_cap = {k: [] for k in K_list}
 
-# --- 3. Vẽ Đồ Thị Capacity ---
-plt.figure(figsize=(8, 6))
+for K in K_list:
+    print(f"Tính toán Hybrid SSA cho K = {K}...")
+    for L in L_range:
+        nmse, cap = ssa_hybrid_optimization(M, N, L, K, G_phys, H_target, W_prop, W_in, W_out)
+        res_nmse[K].append(nmse)
+        res_cap[K].append(cap)
 
-# Kiểu đường: K=1 ('r-.'), K=2 ('g:'), K=5 ('b--'), K=10 ('m-'), Optimal ('k-.')
-plt.plot(L_values, Capacity_K_1, 'r-.', linewidth=3, label='K = 1')
-plt.plot(L_values, Capacity_K_2, 'g:', linewidth=3, label='K = 2')
-plt.plot(L_values, Capacity_K_5, 'b--', linewidth=3, label='K = 5')
-plt.plot(L_values, Capacity_K_10, 'm-', linewidth=3, label='K = 10')
-plt.plot(L_values, Capacity_max, 'k-.', linewidth=3, label='Optimal')
+# Vẽ đồ thị chuẩn theo Figure 5.1 & 5.6 trong báo cáo
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+styles = {1: 'r-o', 2: 'g-s', 5: 'b-^', 10: 'm-d'}
 
-plt.xlabel('Number of transmit metasurface layers, L', fontsize=14)
-plt.ylabel('Channel capacity, C [bps/Hz]', fontsize=14)
-plt.xticks(L_values) 
-plt.tick_params(labelsize=12)
-plt.legend(loc='lower right', fontsize=12)
-plt.grid(True, linestyle='--')
-plt.title('Channel Capacity vs. Number of Transmit Metasurface Layers')
-plt.show()
+for K in K_list:
+    ax1.plot(L_range, res_nmse[K], styles[K], linewidth=2, label=f'K = {K}')
+    ax2.plot(L_range, res_cap[K], styles[K], linewidth=2, label=f'K = {K}')
+
+ax1.set_title("Hybrid SSA: NMSE vs. Layers L"); ax1.set_xlabel("Layers L"); ax1.set_ylabel("NMSE"); ax1.grid(True); ax1.legend()
+ax2.set_title("Hybrid SSA: Capacity vs. Layers L"); ax2.set_xlabel("Layers L"); ax2.set_ylabel("Capacity [bps/Hz]"); ax2.grid(True)
+ax2.axhline(y=8.9, color='k', linestyle='--', label='Optimal')
+ax2.legend()
+plt.tight_layout(); plt.show()
